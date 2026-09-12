@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Виртуальное окружение
+.venv/
+venv/
+
+# Секреты и локальные настройки
+.env
+.env.*
+!.env.template
+poetry.toml
+
+# PyCharm
+.idea/
+
+# Django
+db.sqlite3
+db.sqlite3-journal
+media/
+staticfiles/
+
+# Отчёты тестирования
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
+# Celery и логи
+celerybeat-schedule*
+celerybeat.pid
+*.log
+
+# Windows
+Thumbs.db
