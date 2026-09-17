@@ -23,6 +23,7 @@ staticfiles/
 
 # Отчёты тестирования
 .coverage.*
+.coverage
 htmlcov/
 .pytest_cache/
 
