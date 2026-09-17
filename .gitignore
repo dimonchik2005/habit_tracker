@@ -22,8 +22,8 @@ media/
 staticfiles/
 
 # Отчёты тестирования
-.coverage
 .coverage.*
+.coverage
 htmlcov/
 .pytest_cache/
 
