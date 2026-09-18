@@ -14,10 +14,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: habit-tracker-pipeline
+  cancel-in-progress: false
+
 jobs:
   checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     services:
       postgres:
@@ -80,3 +84,67 @@ jobs:
 
       - name: Build Docker image
         run: docker build -t habit-tracker:${{ github.sha }} .
+
+      - name: Configure SSH
+        if: github.event_name == 'push' && github.ref == 'refs/heads/feature/docker-deploy'
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts
+
+      - name: Transfer image and configuration
+        if: github.event_name == 'push' && github.ref == 'refs/heads/feature/docker-deploy'
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          set -euo pipefail
+
+          docker tag "habit-tracker:$GITHUB_SHA" habit-tracker:local
+          docker save habit-tracker:local | gzip > /tmp/habit-tracker.tar.gz
+
+          ssh -i ~/.ssh/deploy_key \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$SSH_USER@$SSH_HOST" \
+            'test -s ~/habit_tracker/.env && mkdir -p ~/habit_tracker/nginx'
+
+          scp -i ~/.ssh/deploy_key \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            /tmp/habit-tracker.tar.gz docker-compose.yml \
+            "$SSH_USER@$SSH_HOST:habit_tracker/"
+
+          scp -i ~/.ssh/deploy_key \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            nginx/default.conf \
+            "$SSH_USER@$SSH_HOST:habit_tracker/nginx/default.conf"
+
+      - name: Deploy application
+        if: github.event_name == 'push' && github.ref == 'refs/heads/feature/docker-deploy'
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$SSH_USER@$SSH_HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd ~/habit_tracker
+
+          docker load -i habit-tracker.tar.gz
+          rm habit-tracker.tar.gz
+
+          docker compose config --quiet
+          docker compose up -d --no-build --force-recreate \
+            --wait --wait-timeout 180
+
+          curl --fail --silent --show-error --location \
+            --retry 10 --retry-delay 3 --retry-connrefused \
+            --max-time 15 \
+            http://127.0.0.1/admin/login/ > /dev/null
+
+          docker compose ps -a
+          REMOTE
