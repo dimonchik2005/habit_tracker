@@ -1,0 +1,15 @@
+.git
+.idea
+.venv
+venv
+__pycache__
+*.py[cod]
+.env
+.env.*
+!.env.template
+.coverage*
+htmlcov
+.pytest_cache
+staticfiles
+*.log
+celerybeat-schedule*
