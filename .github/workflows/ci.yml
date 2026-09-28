@@ -1,0 +1,150 @@
+name: Habit Tracker CI
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+      - feature/docker-deploy
+  pull_request:
+    branches:
+      - develop
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: habit-tracker-pipeline
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: habit_tracker_ci
+          POSTGRES_USER: ci_user
+          POSTGRES_PASSWORD: ci_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci_user -d habit_tracker_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      SECRET_KEY: "ci-only-django-key-not-for-production"
+      DEBUG: "False"
+      ALLOWED_HOSTS: "localhost,127.0.0.1,testserver"
+      DATABASE_NAME: habit_tracker_ci
+      DATABASE_USER: ci_user
+      DATABASE_PASSWORD: ci_password
+      DATABASE_HOST: 127.0.0.1
+      DATABASE_PORT: "5432"
+      CELERY_BROKER_URL: redis://127.0.0.1:6379/0
+      CELERY_RESULT_BACKEND: redis://127.0.0.1:6379/1
+      TELEGRAM_BOT_TOKEN: ""
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install Poetry
+        run: python -m pip install "poetry>=2.2,<3"
+
+      - name: Install dependencies
+        run: poetry install --with dev --no-root --no-interaction
+
+      - name: Run tests
+        run: poetry run python manage.py test
+
+      - name: Run Ruff
+        run: poetry run ruff check .
+
+      - name: Build Docker image
+        run: docker build -t habit-tracker:${{ github.sha }} .
+
+      - name: Configure SSH
+        if: github.event_name == 'push' && github.ref == 'refs/heads/feature/docker-deploy'
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts
+
+      - name: Transfer image and configuration
+        if: github.event_name == 'push' && github.ref == 'refs/heads/feature/docker-deploy'
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          set -euo pipefail
+
+          docker tag "habit-tracker:$GITHUB_SHA" habit-tracker:local
+          docker save habit-tracker:local | gzip > /tmp/habit-tracker.tar.gz
+
+          ssh -i ~/.ssh/deploy_key \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$SSH_USER@$SSH_HOST" \
+            'test -s ~/habit_tracker/.env && mkdir -p ~/habit_tracker/nginx'
+
+          scp -i ~/.ssh/deploy_key \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            /tmp/habit-tracker.tar.gz docker-compose.yml \
+            "$SSH_USER@$SSH_HOST:habit_tracker/"
+
+          scp -i ~/.ssh/deploy_key \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            nginx/default.conf \
+            "$SSH_USER@$SSH_HOST:habit_tracker/nginx/default.conf"
+
+      - name: Deploy application
+        if: github.event_name == 'push' && github.ref == 'refs/heads/feature/docker-deploy'
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$SSH_USER@$SSH_HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd ~/habit_tracker
+
+          docker load -i habit-tracker.tar.gz
+          rm habit-tracker.tar.gz
+
+          docker compose config --quiet
+          docker compose up -d --no-build --force-recreate \
+            --wait --wait-timeout 180
+
+          curl --fail --silent --show-error --location \
+            --retry 10 --retry-delay 3 --retry-connrefused \
+            --max-time 15 \
+            http://127.0.0.1/admin/login/ > /dev/null
+
+          docker compose ps -a
+          REMOTE
